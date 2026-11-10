@@ -1,21 +1,22 @@
-# ResearchGraph force graph engine design
+# Force-directed graph renderer design
 
-This reference captures the behavior that was implemented and tested in the earlier ResearchGraph graph work. It is guidance for reuse, not a new API contract.
+This reference describes a reusable renderer architecture for small and medium interactive node-and-edge graphs. It is implementation guidance rather than a fixed API.
 
 ## Data boundary
 
-The renderer consumes a small `GraphData` projection:
+Keep the graph projection small and serializable:
 
-- nodes have a stable `id`, a `type` or legacy `kind`, bilingual labels, and optional short display fields;
-- edges have stable `id`, `source`, `target`, a relation type, optional Chinese label, and optional dashed/basis flags;
+- nodes have a stable `id`, a `type` or `kind`, labels, and optional short display fields;
+- edges have a stable `id`, `source`, `target`, a relation type, optional display labels, and optional semantic-basis flags;
 - positions are separate records `{ node_id, x, y, pinned }`;
-- the viewport is separate `{ pan_x, pan_y, zoom }`.
+- the viewport is separate `{ pan_x, pan_y, zoom }`;
+- long text, raw model output, provenance, and domain records stay outside the rendering projection.
 
-For Lite, the semantic graph is a single-paper LightGraph containing `RESEARCH_QUESTION`, `CONCEPT`, `METHOD`, `CONTRIBUTION`, and `FINDING` nodes, normally 6–12 and never padded with invented content. Relations are directed and use the most specific available type (`INVESTIGATES`, `USES`, `ANALYZES`, `YIELDS`, `CONTRIBUTES_TO`, or `RELATED_TO`). Node and relation `basis` distinguishes `EXPLICIT` from `INFERRED`. Evidence, citation, page, quote, source span, and paragraph provenance do not belong in this projection.
+The renderer should accept a graph that is already validated by its caller. It should not infer missing edges, create formal domain IDs, or silently turn display metadata into semantic relationships.
 
 ## Deterministic seeding and simulation
 
-`placeNodes` first reuses saved finite coordinates by stable node ID. New nodes receive deterministic seeds:
+Seed positions from saved finite coordinates by stable node ID. Give new nodes deterministic initial positions so the same input is visually reproducible. One useful spiral seed is:
 
 ```text
 x = cos(i * 2.399) * (180 + i * 9)
@@ -23,7 +24,7 @@ y = sin(i * 2.399) * (180 + i * 9)
 pinned = false
 ```
 
-The local `ForceSimulation` owns transient coordinates and never mutates knowledge data. Its current bounded model is:
+The physics engine owns transient coordinates and never mutates domain data. A bounded local model can use:
 
 - `wake()` sets `alpha = 0.75`;
 - pairwise repulsion uses `min(12, 2600 / distance² + max(0, 50 - distance) * 0.12)` with a minimum distance of 4;
@@ -36,55 +37,52 @@ The local `ForceSimulation` owns transient coordinates and never mutates knowled
 - `pin` toggles the flag, clears velocity, and reheats;
 - `snapshot` emits only serializable position records.
 
-These values keep the graph responsive for the small LightGraph projection. Do not turn this into a global graph layout service or feed full paper text into the physics loop.
+These values are a practical starting point for a small graph. Tune them against real graph sizes and interaction latency, and keep the tick loop bounded so it cannot monopolize the UI thread.
 
-## React Flow behavior
+## Rendering and interaction
 
-The renderer is a controlled projection over React Flow. Nodes remain measured at 18×18 pixels so rapid controlled updates do not make React Flow hide them. The renderer maps positions from the simulation into node positions and maps graph edges into straight, non-connectable edges.
+Treat the graph surface as a controlled projection over React Flow, SVG, Canvas, or an equivalent renderer. Keep node dimensions known and bounded so rapid controlled updates do not make nodes disappear.
 
 Interaction invariants:
 
 - pointer dragging calls `move`; drag stop snapshots and persists positions;
-- double-click toggles pinning and persists the snapshot;
-- an external pin request toggles the requested node;
+- double-click or an explicit control toggles pinning and persists the snapshot;
 - node click selects a node, edge click selects an edge, and pane click clears node selection;
 - hover or selection highlights the active node and first-order neighbors; unrelated nodes and edges fade;
 - hovering an incident edge may show its relation label;
-- `EXPLICIT` and `INFERRED` relations remain distinguishable, with dashed styling available for inferred edges;
+- semantic basis values such as `EXPLICIT` and `INFERRED` remain distinguishable, with dashed styling available for inferred edges;
 - the viewport is persisted on `onMoveEnd` and starts from the saved `defaultViewport`;
-- `fitView` runs only for an initial version-0 layout, a changed view scope, or an explicit fit request;
-- polling, language changes, resize, hover, and sidebar changes do not restart physics or fit the view;
-- `minZoom` is `0.1`, `maxZoom` is `4`, double-click zoom is disabled, and deletion/connection affordances are disabled;
+- `fitView` runs only for an initial empty layout, a changed graph scope, or an explicit fit request;
+- polling, label-language changes, resize, hover, and unrelated sidebar changes do not restart physics or fit the view;
+- set sensible minimum and maximum zoom values, disable accidental double-click zoom when double-click means pinning, and disable editing affordances when the graph is read-only;
 - requestAnimationFrame callbacks are cancelled on unmount; reduced-motion mode advances a bounded batch and persists once rather than animating every frame.
 
-## Persistence and versioning
+## Persistence and identity
 
-Semantic results and layout are separate versions. A layout may be reused when the paper identity, literature version, graph scope, and stable node IDs match. A new literature version must start without the old positions and camera. Resetting layout keeps only explicitly pinned positions when the product asks for a rearrangement; it must not rewrite the semantic graph.
+Semantic results and layout are separate versions. A layout may be reused only when the graph identity, graph scope, and stable node IDs match. A changed graph identity or incompatible topology must start with a fresh layout or an explicitly migrated subset. Resetting layout may preserve explicitly pinned positions, but it must never rewrite semantic graph data.
 
-Persist after meaningful boundaries: drag stop, pin/unpin, cooled simulation, and viewport movement. Debounce or queue the outer store as needed, but do not write the database on every physics tick. If the persistence layer has optimistic versions, retain a local draft until the server acknowledges it and resolve conflicts by reloading the current server layout rather than silently overwriting it.
+Persist after meaningful boundaries: drag stop, pin/unpin, cooled simulation, and viewport movement. Debounce or queue the outer store as needed, but do not write storage on every physics tick. If persistence uses optimistic versions, retain a local draft until the store acknowledges it and resolve conflicts by reloading the current stored layout instead of silently overwriting it.
 
 ## Visual language
 
-Use the shared `graphAppearance` table for node color and Chinese labels. The current Lite palette covers the five node kinds above and an `UNKNOWN` fallback (`#74847b`). Unknown values must never render as a white default node. Color communicates type only; it does not communicate truth, review, or scientific quality.
+Use one appearance table for node colors, labels, filters, and the legend. Unknown kinds need a visible fallback and must not render as an unintended white default. Color communicates type or category only; it does not communicate truth, review, confidence, or scientific quality unless the product explicitly defines that meaning.
 
-The graph UI should identify itself as an AI-generated single-paper concept graph and provide a legend, node details, relation details, and a clear empty state. Keep bilingual labels available: Chinese is the primary display, English preserves the paper's terminology, and `both` shows both when present.
+Provide a legend, node details, relation details, and an explicit empty state. Keep labels accessible in the available languages without changing geometry when the display language changes. Important information must not be available only through hover.
 
-## Historical full-graph lessons that still apply
+## Scope and safety boundaries
 
-The earlier full graph workspace established useful shell behavior: search and type/paper filters precede the canvas, details follow the canvas, a focused node highlights a local neighborhood, full-screen keeps the same canvas instance, and resize does not unexpectedly refit. It also established that shared support nodes should be represented once and that navigation edges must not be mistaken for scientific relations.
-
-Those behaviors are reusable UI lessons only. Do not bring back the old cross-paper graph, Evidence nodes, Query, Lint, Wiki, comparator, or automatic knowledge-evolution workflows into Lite.
+The renderer is a visualization and interaction layer. Keep application-specific workflows, network calls, model prompts, evidence review, document publication, and domain-specific validation in the surrounding application. Do not make the renderer responsible for proving the meaning of an edge or deciding which domain records should exist.
 
 ## Change checklist
 
-When modifying this engine, inspect:
+When modifying an implementation, inspect the equivalent of:
 
-1. `apps/desktop/src/ForceGraph.tsx`
-2. `apps/desktop/src/forceSimulation.ts`
-3. `apps/desktop/src/graphLayout.ts`
-4. `apps/desktop/src/graphTypes.ts`
-5. `apps/desktop/src/graphAppearance.tsx`
-6. `apps/desktop/src/ForceGraph.design.test.tsx`
-7. `apps/desktop/e2e/graph.spec.ts` when browser behavior changes.
+1. the graph renderer;
+2. the force simulation;
+3. the deterministic layout seeder;
+4. the graph data types;
+5. the shared appearance/legend table;
+6. the design-contract test;
+7. the browser or device test when real pointer, zoom, resize, or accessibility behavior changes.
 
-Confirm that the change preserves finite coordinates, stable IDs, camera/layout separation, bounded physics, reduced-motion behavior, and the Lite semantic boundary before changing force constants or data contracts.
+Confirm that the change preserves finite coordinates, stable IDs, camera/layout separation, bounded physics, reduced-motion behavior, semantic/layout separation, and empty-graph handling before changing force constants or data contracts.
